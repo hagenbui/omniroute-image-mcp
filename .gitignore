@@ -1,0 +1,15 @@
+image.env
+.env
+*.env
+!image.env.example
+.api-key
+config.json
+images/
+references/
+queue/
+.generation.lock
+.generation.slot-*.lock
+.queue.lock
+*.log
+__pycache__/
+.DS_Store
