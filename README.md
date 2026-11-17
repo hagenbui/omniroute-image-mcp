@@ -22,7 +22,7 @@ The working runtime keeps launch-local.sh plus a dated backup. Replacing the liv
 
 ### Verified
 
-Remote core:30 tests passed with fake credentials and a localhost fake provider. Bridge:4 tests passed, including old recovery and atomic local cache. Real SSH initialization/tool discovery passed for Desktop, Code and OpenCode; exact old-image retrieval passed. Independent review found no blocking issues. A paid live reference edit was not run because automatic approval review rejected image export/quota use.
+Remote core:30 tests passed with fake credentials and a localhost fake provider. Bridge:8 tests passed, including old recovery and atomic local cache. Real SSH initialization/tool discovery passed for Desktop, Code and OpenCode; exact old-image retrieval passed. Independent review found no blocking issues. A paid live reference edit was not run because automatic approval review rejected image export/quota use.
 
 ## New Claude Desktop setup on this Mac
 
@@ -128,3 +128,7 @@ The launcher is Mac-specific (/usr/bin/python3); other operating systems need an
 - Jobs survive client disconnects, but reboot or worker termination can leave unknown outcomes; jobs are not automatically replayed.
 - Upstream timeouts may still be billed. Usage is recorded only when supplied by the provider.
 - codex/gpt-5.6-sol is the native model behind the older codex/gpt-5.6-sol-image catalog alias. The deployed per-account inventory filter rejected that alias; do not restore it without verification.
+
+## SSH idle-disconnect fix (2026-11-17)
+
+The Mac MCP bridge stays running without holding an idle SSH session. Discovery and ping are local; each actual remote tool call opens its own SSH connection and closes it afterward. A connection failure returns a tool error and does not replay the paid request. The next call opens a fresh connection. Generation requests have known IDs before submission so failures can include an exact recovery ticket. Real tests verified two successive SSH calls and idle ping for all three clients; eight bridge tests pass. New paid generation was not part of this verification.

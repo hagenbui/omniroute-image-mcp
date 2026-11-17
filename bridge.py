@@ -5,11 +5,10 @@ import subprocess
 import sys
 import threading
 import pathlib
-import select
 import base64
 import uuid
 import tempfile
-from server import reference_data_url, request_paths, saved_images, output_root, client_root, validate_png, atomic_json
+from server import dispatch, reference_data_url, request_paths, saved_images, output_root, client_root, validate_png, atomic_json
 
 def prepare(message):
     if message.get('method') == 'tools/call':
@@ -113,71 +112,119 @@ def cache_result(line):
     return json.dumps(message) + '\n'
 
 
-def main():
+def remote_call(message, send):
     client = os.environ.get('OMNIROUTE_IMAGE_CLIENT')
     if client not in ('claude-desktop', 'claude-code', 'opencode'):
-        raise SystemExit('An explicit client name is required.')
+        raise ValueError('An explicit client name is required.')
     command = 'set -eu; . "$HOME/services/image-mcp/image.env"; export OMNIROUTE_IMAGE_CLIENT=' + client + '; exec python3 "$HOME/services/image-mcp/server.py"'
     process = subprocess.Popen(
         ['/usr/bin/ssh','-T','-o','BatchMode=yes','-o','ConnectTimeout=10',
          '-o','ServerAliveInterval=30','-o','ServerAliveCountMax=3',
          os.environ.get('OMNIROUTE_IMAGE_SSH_HOST','worker-host'), command],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-    output_lock = threading.Lock()
-    def send_line(line):
-        with output_lock:
-            sys.stdout.write(line)
-            sys.stdout.flush()
-    def output():
+    ticket = None
+
+    def exchange(request):
+        process.stdin.write(json.dumps(request)+'\n')
+        process.stdin.flush()
         for line in process.stdout:
-            try:
-                line = cache_result(line)
-            except (ValueError, KeyError, OSError, TypeError):
-                # Preserve the returned image even if the optional Mac cache fails.
-                print('Image returned; local cache unavailable. Use its ticket to fetch again.', file=sys.stderr)
-            send_line(line)
-    reader = threading.Thread(target=output, daemon=True)
-    reader.start()
-    def incoming():
-        pending = bytearray()
-        while process.poll() is None:
-            ready, _, _ = select.select([sys.stdin], [], [], 0.2)
-            if not ready:
-                continue
-            chunk = os.read(sys.stdin.fileno(), 65536)
-            if not chunk:
-                if pending:
-                    yield pending.decode()
-                break
-            pending.extend(chunk)
-            while b'\n' in pending:
-                line, _, rest = pending.partition(b'\n')
-                pending = bytearray(rest)
-                yield line.decode()
+            response = json.loads(line)
+            if response.get('id') == request['id']:
+                return response
+            if 'id' not in response:
+                send(response)
+        raise RuntimeError('SSH connection ended before the result arrived.')
+
     try:
-        for line in incoming():
-            message = {}
-            try:
-                message = json.loads(line)
-                if not isinstance(message, dict):
-                    raise ValueError('Expected a JSON-RPC object.')
-                local = local_result(message)
-                if local is not None:
-                    send_line(json.dumps({'jsonrpc':'2.0','id':message.get('id'),'result':local})+'\n')
-                    continue
-                prepared = prepare(message)
-            except (ValueError, OSError) as exc:
-                message = message if isinstance(message, dict) else {}
-                send_line(json.dumps({'jsonrpc':'2.0','id':message.get('id'),
-                  'result':{'isError':True,'content':[{'type':'text','text':str(exc)}]}})+'\n')
-                continue
-            process.stdin.write(json.dumps(prepared)+'\n')
-            process.stdin.flush()
+        message = json.loads(json.dumps(message))
+        params = message.get('params') or {}
+        if params.get('name') in ('generate_image', 'edit_reference_image'):
+            args = params.get('arguments') or {}
+            if 'session_id' not in args and 'request_id' not in args:
+                if not args.get('reference_ticket'):
+                    setup = exchange({'jsonrpc':'2.0','id':'setup-'+str(uuid.uuid4()),
+                        'method':'tools/call','params':{'name':'create_image_session','arguments':{}}})
+                    result = setup.get('result') or {}
+                    if 'error' in setup or result.get('isError'):
+                        raise RuntimeError('Could not prepare a remote image session. No image was submitted.')
+                    identifiers = json.loads(result['content'][0]['text'])
+                    args['session_id'] = identifiers['session_id']
+                    args['request_id'] = identifiers['request_id']
+                elif isinstance(args['reference_ticket'], str) and args['reference_ticket'].count(':') == 1:
+                    args['session_id'] = args['reference_ticket'].split(':')[0]
+                    args['request_id'] = str(uuid.uuid4())
+                params['arguments'] = args
+            if args.get('session_id') and 'request_id' not in args:
+                args['request_id'] = str(uuid.uuid4())
+                params['arguments'] = args
+            if args.get('session_id') and args.get('request_id'):
+                ticket = args['session_id'] + ':' + args['request_id']
+        return exchange(message)
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
+        detail = ('Hosted image connection failed. No automatic retry was made. '
+                  'If an image was submitted it may still be running or billed. ')
+        if ticket:
+            detail += 'Recover only this exact ticket with fetch_image: ' + ticket
+        else:
+            detail += 'Check the server connection before your next request.'
+        raise RuntimeError(detail) from exc
     finally:
-        process.stdin.close()
-        reader.join()
-        process.wait()
-    raise SystemExit(process.returncode)
+        try:
+            process.stdin.close()
+        except (OSError, BrokenPipeError):
+            pass
+        process.stdout.close()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            process.wait()
+
+
+def handle(message, send):
+    try:
+        if message.get('method') != 'tools/call':
+            result = dispatch(message)
+            if message.get('method') == 'initialize':
+                result['serverInfo']['version'] += '-ssh-on-demand'
+            send({'jsonrpc':'2.0','id':message['id'],'result':result})
+            return
+        local = local_result(message)
+        if local is not None:
+            send({'jsonrpc':'2.0','id':message['id'],'result':local})
+            return
+        response = remote_call(prepare(message), send)
+        try:
+            response = json.loads(cache_result(json.dumps(response)))
+        except (ValueError, KeyError, OSError, TypeError):
+            print('Image returned; local cache unavailable. Use its ticket to fetch again.', file=sys.stderr)
+        send(response)
+    except Exception as exc:
+        send({'jsonrpc':'2.0','id':message.get('id'),'result':{'isError':True,
+            'content':[{'type':'text','text':str(exc)}]}})
+
+
+def main():
+    lock = threading.Lock()
+    def send(message):
+        with lock:
+            sys.stdout.write(json.dumps(message)+'\n')
+            sys.stdout.flush()
+    for line in sys.stdin:
+        try:
+            message = json.loads(line)
+            if not isinstance(message, dict):
+                raise ValueError('Expected a JSON-RPC object.')
+        except (ValueError, TypeError):
+            send({'jsonrpc':'2.0','id':None,'error':{'code':-32700,'message':'Invalid JSON-RPC message'}})
+            continue
+        if 'id' not in message:
+            continue
+        if message.get('method') == 'tools/call':
+            threading.Thread(target=handle, args=(message,send), daemon=True).start()
+        else:
+            handle(message,send)
+
 
 if __name__ == '__main__':
     main()

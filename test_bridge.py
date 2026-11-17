@@ -4,7 +4,7 @@ import sys
 import tempfile
 import unittest
 import os,json,uuid,base64,struct,zlib,io
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parent))
 spec=importlib.util.spec_from_file_location('bridge',pathlib.Path(__file__).with_name('bridge.py'))
 bridge=importlib.util.module_from_spec(spec);spec.loader.exec_module(bridge)
@@ -46,6 +46,63 @@ class Test(unittest.TestCase):
         self.assertEqual(info['remote_path'],'/home/user/remote.png')
         recovery=bridge.local_result({'method':'tools/call','params':{'name':'recover_saved_image','arguments':{'sessionId':sid,'requestId':rid}}})
         self.assertEqual(base64.b64decode(recovery['content'][1]['data']),png)
+
+    def test_connection_failure_does_not_replay_and_next_call_can_succeed(self):
+        message={'jsonrpc':'2.0','id':7,'method':'tools/call','params':{'name':'create_image_session','arguments':{}}}
+        send=Mock()
+        with patch.object(bridge,'remote_call',side_effect=[RuntimeError('SSH disconnected'),{'jsonrpc':'2.0','id':8,'result':{'content':[]}}]) as remote:
+            bridge.handle(message,send)
+            self.assertEqual(remote.call_count,1)
+            self.assertTrue(send.call_args[0][0]['result']['isError'])
+            bridge.handle(dict(message,id=8),send)
+            self.assertEqual(remote.call_count,2)
+            self.assertEqual(send.call_args[0][0]['id'],8)
+            self.assertFalse(send.call_args[0][0]['result'].get('isError',False))
+
+    def test_discovery_and_ping_do_not_open_idle_ssh_connection(self):
+        with patch.object(bridge,'remote_call') as remote:
+            send=Mock()
+            for i,method in enumerate(('initialize','tools/list','ping')):
+                bridge.handle({'jsonrpc':'2.0','id':i,'method':method,'params':{}},send)
+                self.assertIn('result',send.call_args[0][0])
+            self.assertFalse(remote.called)
+
+    def test_lost_generation_connection_keeps_exact_ticket_without_resubmission(self):
+        sid,rid=str(uuid.uuid4()),str(uuid.uuid4())
+        sent=[];responses=[]
+        class Input:
+            def write(self,line):
+                request=json.loads(line);sent.append(request)
+                if request['params']['name']=='create_image_session':
+                    responses.append(json.dumps({'id':request['id'],'result':{'content':[{'type':'text','text':json.dumps({'session_id':sid,'request_id':rid})}]}})+'\n')
+            def flush(self):pass
+            def close(self):pass
+        class Output:
+            def __iter__(self):return self
+            def __next__(self):
+                if not responses:raise StopIteration
+                return responses.pop(0)
+            def close(self):pass
+        process=Mock(stdin=Input(),stdout=Output())
+        with patch.object(bridge.subprocess,'Popen',return_value=process) as spawn:
+            with self.assertRaisesRegex(RuntimeError,sid+':'+rid):
+                bridge.remote_call({'id':9,'method':'tools/call','params':{'name':'generate_image','arguments':{'prompt':'test'}}},Mock())
+            self.assertEqual(spawn.call_count,1)
+        self.assertEqual([r['params']['name'] for r in sent],['create_image_session','generate_image'])
+        self.assertEqual(sent[-1]['params']['arguments']['request_id'],rid)
+
+    def test_existing_session_gets_known_request_id_before_submission(self):
+        sid=str(uuid.uuid4())
+        process=Mock(stdin=Mock())
+        # A concrete empty response stream models SSH loss immediately after write.
+        process.stdout=io.StringIO('')
+        with patch.object(bridge.subprocess,'Popen',return_value=process):
+            with self.assertRaises(RuntimeError) as exc:
+                bridge.remote_call({'id':8,'method':'tools/call','params':{'name':'generate_image','arguments':{'session_id':sid,'prompt':'test'}}},Mock())
+        sent=json.loads(process.stdin.write.call_args[0][0])
+        rid=sent['params']['arguments']['request_id']
+        self.assertEqual(str(uuid.UUID(rid)),rid)
+        self.assertIn(sid+':'+rid,str(exc.exception))
 
     def test_explicit_file_is_uploaded_and_ticket_is_untouched(self):
         with tempfile.TemporaryDirectory() as tmp:
