@@ -2,7 +2,27 @@
 
 Local stdio MCP connector for Claude Desktop, Claude Code and OpenCode. Python standard library only. Version 1.6.1.
 
-Requests go through your OmniRoute endpoint. OmniRoute uses its connected provider account to generate images. This repo contains no API keys, provider tokens, generated images or live jobs.
+Requests go through your OmniRoute endpoint. OmniRoute uses its connected provider account to generate images. This repo contains no API keys, provider tokens, generated images or live jobs. Source launch.sh is the local version; the active installation now uses the hosted launcher described below.
+
+## Current installation: hosted on the worker host (2026-11-17)
+
+The working Mac launcher now runs bridge.py over SSH to the worker host. Generation, persistent queue and primary image files live at ~/services/image-mcp on the worker host. OmniRoute is reached directly there on loopback port20128. The Mac bridge uploads explicit local references, returns inline images, caches returned images at their original Mac output location, and recovers old local tickets exactly.
+
+The shared queue runs two jobs and holds up to32 waiting, across all clients using this server installation. Client connections can disconnect while workers continue on the worker host. This is a private SSH deployment, not a public HTTPS MCP URL: a native Claude web/mobile connection still needs an appropriate client bridge. A Mac or another device running a compatible SSH client is required to make tool calls.
+
+### Add to another Mac
+
+Install server.py, bridge.py, and launch-remote.sh in a private runtime directory, create image.env with local output directory settings, configure SSH alias worker-host for your own authorized key, and use launch-remote.sh instead of launch.sh in the client examples below. The new computer needs SSH authorization to the worker host. Do not copy private SSH keys or image.env into Git.
+
+The bridge sources local image.env for the old image output directory and optional OMNIROUTE_IMAGE_SSH_HOST (defaults to worker-host). The provider API key is kept in the worker host's private image.env; a new bridge-only computer does not require that key locally.
+
+### Rollback on the existing Mac
+
+The working runtime keeps launch-local.sh plus a dated backup. Replacing the live launch.sh with launch-local.sh restores the local implementation. Do this only when client activity is idle, then reconnect clients. Remote queued jobs must finish or be explicitly dealt with; do not regenerate them during rollback. Old local and remote tickets have different storage locations.
+
+### Verified
+
+Remote core:30 tests passed with fake credentials and a localhost fake provider. Bridge:4 tests passed, including old recovery and atomic local cache. Real SSH initialization/tool discovery passed for Desktop, Code and OpenCode; exact old-image retrieval passed. Independent review found no blocking issues. A paid live reference edit was not run because automatic approval review rejected image export/quota use.
 
 ## New Claude Desktop setup on this Mac
 
