@@ -118,7 +118,7 @@ def remote_call(message, send):
         raise ValueError('An explicit client name is required.')
     command = 'set -eu; . "$HOME/services/image-mcp/image.env"; export OMNIROUTE_IMAGE_CLIENT=' + client + '; exec python3 "$HOME/services/image-mcp/server.py"'
     process = subprocess.Popen(
-        ['/usr/bin/ssh','-T','-o','BatchMode=yes','-o','ConnectTimeout=10',
+        ['/usr/bin/ssh','-C','-T','-o','BatchMode=yes','-o','ConnectTimeout=10',
          '-o','ServerAliveInterval=30','-o','ServerAliveCountMax=3',
          os.environ.get('OMNIROUTE_IMAGE_SSH_HOST','worker-host'), command],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)

@@ -136,3 +136,9 @@ The Mac MCP bridge stays running without holding an idle SSH session. Discovery 
 ## SSH response deadline (2026-11-18)
 
 Each tool connection has a50-second overall deadline, including connection setup and response transfer. Expiry closes only the local SSH child; already submitted remote workers continue. Errors retain the exact known ticket and never resubmit. Nine bridge tests pass; focused review also simulated a real sleeping transport and confirmed deadline exit with no retry.
+
+## MCP1.6.2: separate submission from image transfer
+
+The hosted environment sets OMNIROUTE_IMAGE_RESPONSE_WAIT_SECONDS=0. Submission returns a durable ticket immediately; pending fetches return successful queued/running state without waiting for rendering. Clients wait20–30seconds before fetching the same ticket again. Completed results keep full image quality and original files. SSH-C compresses transport; the50-second transport deadline remains a guard against genuine network stalls. Mac/local installations default to the previous38-second wait unless explicitly configured otherwise.
+
+Verification:32 core tests and9 bridge tests; real SSH synthetic-provider integration returned a ticket in2.03seconds and a1.97MB inline PNG+Mac cache in13.23seconds total. This integration uses fake credentials and no OpenAI requests. Run test_hosted_e2e.py only when the configured worker-host SSH destination is yours and temporary diagnostic processes are acceptable. Ordinary unit tests do not need SSH. No new paid live generation was used for this repair.

@@ -173,6 +173,31 @@ class Tests(unittest.TestCase):
             self.assertFalse(spawn.called)
             self.assertFalse((self.folder/(self.rid+'.state.json')).exists())
 
+    def test_async_submission_returns_ticket_without_waiting_for_generation(self):
+        with patch.object(s,'CLAUDE_WAIT_SECONDS',0):
+            with patch.object(s.subprocess,'Popen') as spawn, (Path(self.tmp.name)/'guard').open('a') as guard:
+                def wait(timeout=None):
+                    if timeout is None: return 0
+                    self.assertEqual(timeout,0)
+                    raise subprocess.TimeoutExpired('worker',timeout)
+                spawn.return_value.wait.side_effect=wait
+                result=s.run_detached(self.args,None,guard)
+        state=json.loads(result['content'][0]['text'])
+        self.assertFalse(result.get('isError'))
+        self.assertEqual(state['ticket'],self.args['session_id']+':'+self.rid)
+        self.assertFalse(state['submitted'])
+        self.assertIn(state['status'],('queued','outcome_unknown'))
+
+    def test_async_fetch_returns_pending_without_long_poll(self):
+        keys={key:self.args[key] for key in ('session_id','request_id')}
+        with (self.folder/(self.rid+'.active')).open('a') as active:
+            s.fcntl.flock(active,s.fcntl.LOCK_EX)
+            s.write_state(self.folder/(self.rid+'.state.json'),{'status':'running','submitted':True})
+            with patch.object(s,'CLAUDE_WAIT_SECONDS',0), patch.object(s.time,'sleep',side_effect=AssertionError('must not wait for render')):
+                result=s.recover(keys)
+        self.assertFalse(result['isError'])
+        self.assertEqual(json.loads(result['content'][0]['text'])['status'],'running')
+
     def test_success_metadata_and_exact_recovery(self):
         self.assertEqual(self.run_worker()['status'], 'completed')
         result = s.saved_images({k:self.args[k] for k in ('session_id','request_id')})
