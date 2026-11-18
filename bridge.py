@@ -123,6 +123,16 @@ def remote_call(message, send):
          os.environ.get('OMNIROUTE_IMAGE_SSH_HOST','worker-host'), command],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     ticket = None
+    expired = threading.Event()
+    def expire():
+        expired.set()
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+    deadline = threading.Timer(50, expire)
+    deadline.daemon = True
+    deadline.start()
 
     def exchange(request):
         process.stdin.write(json.dumps(request)+'\n')
@@ -163,12 +173,15 @@ def remote_call(message, send):
     except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
         detail = ('Hosted image connection failed. No automatic retry was made. '
                   'If an image was submitted it may still be running or billed. ')
+        if expired.is_set():
+            detail = 'Connection reached its 50-second limit. ' + detail
         if ticket:
             detail += 'Recover only this exact ticket with fetch_image: ' + ticket
         else:
             detail += 'Check the server connection before your next request.'
         raise RuntimeError(detail) from exc
     finally:
+        deadline.cancel()
         try:
             process.stdin.close()
         except (OSError, BrokenPipeError):
@@ -177,8 +190,8 @@ def remote_call(message, send):
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            process.terminate()
-            process.wait()
+            process.kill()
+            process.wait(timeout=5)
 
 
 def handle(message, send):

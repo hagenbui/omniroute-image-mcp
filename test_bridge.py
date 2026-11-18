@@ -104,6 +104,19 @@ class Test(unittest.TestCase):
         self.assertEqual(str(uuid.UUID(rid)),rid)
         self.assertIn(sid+':'+rid,str(exc.exception))
 
+    def test_each_ssh_call_has_a_bounded_deadline_and_cancels_it(self):
+        process=Mock(stdin=Mock(),stdout=io.StringIO(''))
+        timer=Mock()
+        with patch.object(bridge.subprocess,'Popen',return_value=process), patch.object(bridge.threading,'Timer',return_value=timer) as factory:
+            with self.assertRaises(RuntimeError):
+                bridge.remote_call({'id':1,'method':'tools/call','params':{'name':'fetch_image','arguments':{'ticket':'exact:ticket'}}},Mock())
+        self.assertEqual(factory.call_count,1)
+        self.assertLess(factory.call_args[0][0],60)
+        self.assertTrue(timer.start.called)
+        self.assertTrue(timer.cancel.called)
+        factory.call_args[0][1]()
+        self.assertTrue(process.kill.called)
+
     def test_explicit_file_is_uploaded_and_ticket_is_untouched(self):
         with tempfile.TemporaryDirectory() as tmp:
             p=pathlib.Path(tmp)/'reference.png';p.write_bytes(b'\x89PNG\r\n\x1a\nreference')

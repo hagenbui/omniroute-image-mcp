@@ -132,3 +132,7 @@ The launcher is Mac-specific (/usr/bin/python3); other operating systems need an
 ## SSH idle-disconnect fix (2026-11-17)
 
 The Mac MCP bridge stays running without holding an idle SSH session. Discovery and ping are local; each actual remote tool call opens its own SSH connection and closes it afterward. A connection failure returns a tool error and does not replay the paid request. The next call opens a fresh connection. Generation requests have known IDs before submission so failures can include an exact recovery ticket. Real tests verified two successive SSH calls and idle ping for all three clients; eight bridge tests pass. New paid generation was not part of this verification.
+
+## SSH response deadline (2026-11-18)
+
+Each tool connection has a50-second overall deadline, including connection setup and response transfer. Expiry closes only the local SSH child; already submitted remote workers continue. Errors retain the exact known ticket and never resubmit. Nine bridge tests pass; focused review also simulated a real sleeping transport and confirmed deadline exit with no retry.
