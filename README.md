@@ -1,8 +1,27 @@
 # OmniRoute Image MCP
 
-Local stdio MCP connector for Claude Desktop, Claude Code and OpenCode. Python standard library only. Version 1.6.1.
+Local stdio MCP connector for Claude Desktop, Claude Code and OpenCode. Version 1.7.0.
 
 Requests go through your OmniRoute endpoint. OmniRoute uses its connected provider account to generate images. This repo contains no API keys, provider tokens, generated images or live jobs. Source launch.sh is the local version; the active installation now uses the hosted launcher described below.
+
+## Install the Claude Code plugin on macOS
+
+To install the published plugin on a Mac configured for the hosted worker:
+
+~~~sh
+claude plugin install omniroute-images --marketplace hagenbui/omniroute-image-mcp
+~~~
+
+On a Mac with the hosted bridge setup described below, run this from the checkout:
+
+~~~sh
+claude plugin install omniroute-images --marketplace "$PWD"
+claude mcp get plugin:omniroute-images:images
+~~~
+
+The plugin runs the checkout's bridge and reads the private settings from `~/Library/Application Support/openai-image-mcp/image.env`. It uses the existing SSH host, image cache, and Claude Code ticket namespace. If Claude Code already has the manual `openai-images` registration, verify the plugin shows **Connected**, then remove just that registration with `claude mcp remove --scope user openai-images`. Keep the separate Claude Desktop Chat and OpenCode registrations.
+
+With a local directory marketplace, Claude Code loads edits from the checkout on the next launch or `/reload-plugins`. For distribution from a Git host, commit the plugin and bridge code, then use the repository's Git URL in place of `"$PWD"` on each Mac. In Claude Code, open `/plugin` → **Marketplaces** → **hagen-image-tools** and enable auto-update. Bump `version` in `.claude-plugin/plugin.json` for each published release. Claude refreshes enabled marketplaces after session startup. Deploy compatible worker changes to the worker host before releasing a plugin that needs them. [Claude Code update behavior](https://code.claude.com/docs/en/discover-plugins#keep-plugins-updated)
 
 ## Current installation: hosted on the worker host (2026-11-17)
 
@@ -98,6 +117,20 @@ Keep it running or manage it as a service. The SSH host must reach OmniRoute on 
 Remote endpoints require HTTPS; HTTP is allowed only for loopback. A proxied public endpoint may cut off long generations; the existing installation uses SSH to avoid that cutoff.
 
 ## Tools and queue
+
+### Choose a model in chat
+
+| Ask your client | What it submits |
+| --- | --- |
+| “Make a square Hội An poster with three lanterns and a teal boat.” | One GPT job (the default). |
+| “Use Gemini to make a square Hội An poster with three lanterns and a teal boat.” | One Gemini job. |
+| “Compare GPT and Gemini on this Hội An poster. Show both, then pick the one that best follows the brief.” | Two jobs with the same prompt and settings, one per model. The client fetches and labels each result. |
+
+`generate_image` and `edit_reference_image` accept an optional `model` of `gpt` or `gemini`. Each job has its own ticket. If GPT fails, the client asks “Would you like to try Gemini?” and waits for your answer. If you already asked for both, the client uses the existing Gemini ticket. If GPT times out with an unknown outcome, recover its ticket before deciding whether to spend quota on another image.
+
+The GPT selection uses `OMNIROUTE_IMAGE_MODEL`. Gemini uses the `antigravity/gemini-3.1-flash-image` route, which must be enabled in OmniRoute. The Gemini worker checks for Pillow with JPEG and WebP support before submitting a provider request. The worker converts these responses to PNG so you can fetch, cache and edit them by ticket. The Mac SSH bridge needs only the standard library. For hosted installations, update `server.py` on both the bridge (tool discovery) and the worker (execution) using the update procedure below.
+
+### Available tools
 
 - generate_image: new image from a prompt; omit IDs.
 - edit_reference_image: prompt plus reference_image (accessible file path or PNG/JPEG/WebP data URL), or exact reference_ticket returned in THIS chat.

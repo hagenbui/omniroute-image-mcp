@@ -16,7 +16,7 @@ import urllib.error
 import uuid
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('server', HERE / 'server.py')
@@ -46,8 +46,9 @@ class Tests(unittest.TestCase):
     def run_worker(self, response=None, error=None):
         s.atomic_json(self.job, self.args)
         s.write_state(self.folder / (self.rid + '.state.json'), {'status': 'queued', 'submitted': False})
-        with patch.object(s.urllib.request, 'urlopen', side_effect=error, return_value=Response(json.dumps(PAYLOAD if response is None else response).encode())):
+        with patch.object(s.urllib.request, 'urlopen', side_effect=error, return_value=Response(json.dumps(PAYLOAD if response is None else response).encode())) as upstream:
             s.worker(self.job)
+        upstream.assert_called_once()
         return json.loads((self.folder / (self.rid + '.state.json')).read_text())
 
     def test_new_image_needs_only_prompt_and_allocates_private_ids(self):
@@ -214,10 +215,95 @@ class Tests(unittest.TestCase):
         self.assertTrue(state['submitted'])
         result = s.saved_images({k:self.args[k] for k in ('session_id','request_id')})
         self.assertEqual(json.loads(result['content'][0]['text'])['status'], 'outcome_unknown')
+        self.assertNotIn('try Gemini', json.loads(result['content'][0]['text'])['next_step'])
 
     def test_rejection_is_failed_not_running(self):
         error = urllib.error.HTTPError('http://test', 400, 'bad', {}, io.BytesIO(b'{"error":{"message":"bad request"}}'))
         self.assertEqual(self.run_worker(error=error)['status'], 'failed')
+        status = json.loads(s.request_status(self.folder, self.rid)['content'][0]['text'])
+        self.assertIn('Would you like to try Gemini?', status['next_step'])
+
+    def test_model_picker_routes_two_independent_jobs_with_the_same_prompt(self):
+        calls = []
+        def provider(request, **kwargs):
+            calls.append(json.loads(request.data))
+            return Response(json.dumps(PAYLOAD).encode())
+        def spawn(command, **kwargs):
+            s.worker(Path(command[3]), Path(command[4]))
+            return Mock()
+        with patch.object(s, 'ROOT', Path(self.tmp.name)), patch.object(s.urllib.request, 'urlopen', side_effect=provider), patch.object(s.subprocess, 'Popen', side_effect=spawn):
+            tickets = []
+            for extra in ({}, {'model':'gemini'}):
+                result = s.dispatch({'method':'tools/call', 'params':{'name':'generate_image','arguments':dict(prompt='three lanterns', **extra)}})
+                self.assertFalse(result.get('isError'), result)
+                tickets.append(json.loads(result['content'][0]['text'])['ticket'])
+                self.assertEqual(s.dispatch({'method':'tools/call','params':{'name':'fetch_image','arguments':{'ticket':tickets[-1]}}})['content'][1]['data'], PAYLOAD['data'][0]['b64_json'])
+        self.assertNotEqual(*tickets)
+        self.assertEqual([(c['model'], c['prompt']) for c in calls], [('codex/test-image', 'three lanterns'), ('antigravity/gemini-3.1-flash-image', 'three lanterns')])
+
+    def test_unknown_model_rejected_before_queueing(self):
+        with patch.object(s, 'ROOT', Path(self.tmp.name)), patch.object(s, 'run_detached') as run:
+            result = s.dispatch({'method':'tools/call','params':{'name':'generate_image','arguments':{'prompt':'poster','model':'typo'}}})
+        self.assertTrue(result.get('isError'))
+        run.assert_not_called()
+
+    def test_gemini_failure_does_not_offer_another_job(self):
+        self.args['model'] = 'gemini'
+        state = self.run_worker(response={'data':[]})
+        self.assertEqual(state['status'], 'failed')
+        step = json.loads(s.request_status(self.folder, self.rid)['content'][0]['text'])['next_step']
+        self.assertNotIn('try Gemini', step)
+
+    def test_gemini_requires_decoders_before_submitting(self):
+        args = dict(self.args, model='gemini')
+        with patch.dict(sys.modules, {'PIL': None}), patch.object(s.urllib.request, 'urlopen') as upstream:
+            with self.assertRaisesRegex(ValueError, 'Pillow'):
+                s.generate(args)
+            upstream.assert_not_called()
+        with patch('PIL.features.check', side_effect=lambda name: name != 'webp'), patch.object(s.urllib.request, 'urlopen') as upstream:
+            with self.assertRaisesRegex(ValueError, 'WebP'):
+                s.generate(args)
+            upstream.assert_not_called()
+        self.assertFalse((self.folder / (self.rid + '.reserved')).exists())
+
+    def test_all_clients_advertise_comparison_for_new_images_and_edits(self):
+        for client in ('claude-desktop', 'claude-code', 'opencode'):
+            with patch.dict(os.environ, {'OMNIROUTE_IMAGE_CLIENT':client}):
+                tools = {t['name']:t for t in s.dispatch({'method':'tools/list'})['tools']}
+                for name in ('generate_image','edit_reference_image'):
+                    field = tools[name]['inputSchema']['properties']['model']
+                    self.assertEqual(field['default'], 'gpt')
+                    self.assertEqual(field['enum'], ['gpt','gemini'])
+                    self.assertIn('once per model', field['description'])
+
+    def test_gemini_returns_recoverable_png_for_jpeg_and_webp(self):
+        from PIL import Image
+        for fmt in ('JPEG', 'WEBP'):
+            with self.subTest(fmt=fmt):
+                args = dict(self.args, model='gemini', request_id=str(uuid.uuid4()))
+                buf = io.BytesIO()
+                Image.new('RGB', (2, 3), 'red').save(buf, format=fmt)
+                encoded = base64.b64encode(buf.getvalue()).decode()
+                item = {'b64_json':encoded} if fmt == 'JPEG' else {'url':'data:image/webp;base64,' + encoded}
+                with patch.object(s.urllib.request, 'urlopen', return_value=Response(json.dumps({'data':[item]}).encode())):
+                    result = s.generate(args)
+                block = result['content'][1]
+                self.assertEqual(block['mimeType'], 'image/png')
+                data = base64.b64decode(block['data'])
+                s.validate_png(data)
+                self.assertEqual(struct.unpack('>II', data[16:24]), (2, 3))
+                self.assertEqual(s.saved_images({k:args[k] for k in ('session_id','request_id')})['content'][1], block)
+
+    def test_webp_canvas_limit_checked_before_opening_decoder(self):
+        from PIL import Image
+        for options in ({}, {'lossless':True}, {'exif':b'Exif\0\0demo'}):
+            with self.subTest(options=options):
+                buf = io.BytesIO()
+                Image.new('RGB', (3, 3), 'red').save(buf, format='WEBP', **options)
+                with patch.object(s, 'MAX_IMAGE_PIXELS', 8, create=True), patch.object(Image, 'open') as decoder:
+                    with self.assertRaisesRegex(ValueError, 'oversized'):
+                        s.gemini_png(buf.getvalue())
+                    decoder.assert_not_called()
 
     def test_invalid_image_not_saved(self):
         state = self.run_worker(response={'data':[{'b64_json':base64.b64encode(b'not image').decode()}]})

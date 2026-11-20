@@ -1,0 +1,12 @@
+{
+  "name": "hagen-image-tools",
+  "owner": { "name": "Hagen Bui" },
+  "metadata": { "description": "Claude plugins for Hagen's image-generation tools." },
+  "plugins": [
+    {
+      "name": "omniroute-images",
+      "source": "./",
+      "description": "Generate, edit, and compare GPT and Gemini images through the hosted OmniRoute worker."
+    }
+  ]
+}

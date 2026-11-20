@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Small stdio MCP image-generation server; Python standard library only."""
+"""Small stdio MCP image-generation server."""
 import hashlib
 import http.client
+import io
 import base64
 import json
 import re
@@ -21,15 +22,20 @@ import zlib
 
 ROOT = pathlib.Path(__file__).resolve().parent
 OUTPUT_LOCK = threading.Lock()
+MAX_IMAGE_PIXELS = 16777216
 
 
-def configuration():
+def configuration(selection='gpt'):
     url = os.environ.get('OMNIROUTE_IMAGE_BASE_URL', '').rstrip('/')
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise ValueError('Set a valid OmniRoute base_url without credentials or query parameters.')
     if parsed.scheme == 'http' and parsed.hostname not in ('localhost', '127.0.0.1', '::1'):
         raise ValueError('Use HTTPS for a remote OmniRoute endpoint.')
+    if selection == 'gemini':
+        return url, 'antigravity/gemini-3.1-flash-image'
+    if selection != 'gpt':
+        raise ValueError('Choose model gpt or gemini.')
     model = os.environ.get('OMNIROUTE_IMAGE_MODEL')
     if not isinstance(model, str) or not model.strip():
         raise ValueError('Set OMNIROUTE_IMAGE_MODEL in image.env.')
@@ -41,6 +47,8 @@ SCHEMA = {
         'request_id': {'type': 'string', 'description': 'Omit for ordinary generate_image calls. Explicit IDs must be canonical UUIDs. Retain for exact recovery after timeout. Never reuse for different inputs.'},
         'reference_image': {'type': 'string', 'description': 'Optional reference image: absolute path on this Mac or a base64 data URL (PNG/JPEG/WebP). In OpenCode, use the readable local-copy path supplied by the attachment handoff for this conversation; do not ask the user to save the attachment or provide its path again. For Cowork VM paths, first copy the file to an accessible Mac path. Never invent a path or base64.'},
         'prompt': {'type': 'string', 'minLength': 1, 'maxLength': 32000},
+        'model': {'type': 'string', 'enum': ['gpt', 'gemini'], 'default': 'gpt',
+                  'description': 'Default to GPT. Use Gemini when specifically requested. For an explicit comparison, call this tool once per model with identical prompt, settings and reference. Keep each ticket, fetch both, and label each result. After a confirmed GPT failure, ask before submitting Gemini. Never duplicate a comparison job.'},
         'size': {'type': 'string', 'enum': ['1024x1024', '1536x1024', '1024x1536'], 'default': '1024x1024'},
         'quality': {'type': 'string', 'enum': ['low', 'medium', 'high'], 'default': 'medium'},
         'background': {'type': 'string', 'enum': ['auto', 'opaque', 'transparent'], 'default': 'auto', 'description': 'Codex image routes support only auto; OmniRoute does not forward explicit background values for that provider.'},
@@ -150,7 +158,7 @@ def validate_png(data):
             if depth not in allowed.get(color, ()) or compression or filtering or interlace not in (0, 1):
                 raise ValueError('Provider returned unsupported PNG header fields.')
             bits_per_pixel = depth * {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color]
-            if not width or not height or width * height > 16777216:
+            if not width or not height or width * height > MAX_IMAGE_PIXELS:
                 raise ValueError('Provider image dimensions exceed the supported limit.')
         if chunks and kind == b'IHDR':
             raise ValueError('Provider returned duplicate PNG headers.')
@@ -187,6 +195,43 @@ def validate_png(data):
                 raise ValueError('Provider returned invalid PNG pixel length.')
             return
     raise ValueError('Provider returned a truncated PNG.')
+
+
+def check_webp_canvas(data):
+    # Pillow's WebP decoder allocates its canvas inside Image.open().
+    kind = data[12:16]
+    if kind == b'VP8X' and len(data) >= 30:
+        if data[20] & 2:
+            raise ValueError('Gemini returned an animated WebP.')
+        width = 1 + int.from_bytes(data[24:27], 'little')
+        height = 1 + int.from_bytes(data[27:30], 'little')
+    elif kind == b'VP8L' and len(data) >= 25 and data[20] == 0x2f:
+        dimensions = int.from_bytes(data[21:25], 'little')
+        width = 1 + (dimensions & 0x3fff)
+        height = 1 + ((dimensions >> 14) & 0x3fff)
+    elif kind == b'VP8 ' and len(data) >= 30 and data[23:26] == b'\x9d\x01\x2a':
+        width, height = struct.unpack_from('<HH', data, 26)
+        width &= 0x3fff
+        height &= 0x3fff
+    else:
+        raise ValueError('Gemini returned an invalid WebP canvas header.')
+    if not width or not height or width * height > MAX_IMAGE_PIXELS:
+        raise ValueError('Gemini returned an invalid or oversized WebP canvas.')
+
+
+def gemini_png(data):
+    from PIL import Image
+    if data.startswith(b'RIFF') and data[8:12] == b'WEBP':
+        check_webp_canvas(data)
+    try:
+        with Image.open(io.BytesIO(data), formats=('JPEG', 'WEBP')) as source:
+            if source.width * source.height > MAX_IMAGE_PIXELS or getattr(source, 'is_animated', False):
+                raise ValueError('Gemini returned an oversized or animated image.')
+            output = io.BytesIO()
+            source.convert('RGBA' if 'A' in source.getbands() else 'RGB').save(output, format='PNG')
+            return output.getvalue()
+    except (OSError, Image.DecompressionBombError):
+        raise ValueError('Gemini returned invalid JPEG or WebP image bytes.') from None
 
 
 def request_paths(args):
@@ -227,7 +272,15 @@ def generate(args):
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 32000:
         raise ValueError('Supply a prompt between 1 and 32000 characters.')
     folder, rid = request_paths(args)
-    base_url, model = configuration()
+    selection = args.get('model', 'gpt')
+    base_url, model = configuration(selection)
+    if selection == 'gemini':
+        try:
+            from PIL import features
+        except ImportError:
+            raise ValueError('Install Pillow on the image worker before using Gemini.') from None
+        if not all(features.check(codec) for codec in ('jpg', 'webp', 'zlib')):
+            raise ValueError('Gemini needs Pillow with JPEG and WebP decoding and PNG encoding on the image worker.')
     payload = {'model': model, 'prompt': prompt, 'n': 1, 'output_format': 'png', 'response_format': 'b64_json'}
     for field in ('size', 'quality', 'background'):
         spec = SCHEMA['properties'][field]
@@ -267,7 +320,7 @@ def generate(args):
         method='POST',
     )
     started = time.monotonic()
-    write_state(folder / (rid + '.state.json'), {'status': 'running', 'submitted': True})
+    write_state(folder / (rid + '.state.json'), {'status': 'running', 'submitted': True, 'selection': selection, 'model': model})
     try:
         with urllib.request.urlopen(request, timeout=float(os.environ.get('OMNIROUTE_IMAGE_TIMEOUT_SECONDS', '600'))) as response:
             provider_request_id = response.headers.get('x-request-id')
@@ -310,13 +363,19 @@ def generate(args):
     encoded = items[0].get('b64_json')
     if not encoded:
         data_url = items[0].get('url', '')
-        if isinstance(data_url, str) and data_url.startswith('data:image/png;base64,'):
+        prefixes = ('data:image/png;base64,', 'data:image/jpeg;base64,', 'data:image/webp;base64,') if selection == 'gemini' else ('data:image/png;base64,',)
+        if isinstance(data_url, str) and data_url.startswith(prefixes):
             encoded = data_url.split(',', 1)[1]
     if not isinstance(encoded, str) or not encoded:
         raise ValueError('OmniRoute did not return base64 image bytes despite response_format=b64_json.')
     data = base64.b64decode(encoded, validate=True)
     if len(data) > 32 * 1024 * 1024:
         raise ValueError('Provider image exceeds 32 MiB.')
+    if selection == 'gemini' and not data.startswith(b'\x89PNG\r\n\x1a\n'):
+        data = gemini_png(data)
+        if len(data) > 32 * 1024 * 1024:
+            raise ValueError('Converted Gemini image exceeds 32 MiB.')
+        encoded = base64.b64encode(data).decode()
     validate_png(data)
     path = folder / (rid + '.png')
     reference = payload.get('images', [{}])[0].get('image_url')
@@ -352,6 +411,8 @@ def request_status(folder, rid):
     state.update(session_id=folder.name, request_id=rid, ticket=folder.name + ":" + rid)
     state['next_step'] = ('The worker continues independently. Wait 20–30 seconds before fetch_image with this ticket; repeat only while queued/running. Never regenerate this request.' if state['status'] in ('queued', 'running')
                           else 'Do not automatically regenerate. A submitted request may have been billed; an intentional retry needs a new request_id.')
+    if state['status'] == 'failed' and state.get('selection') == 'gpt' and state.get('submitted'):
+        state['next_step'] += ' If Gemini was already requested for this comparison, use its existing ticket. Otherwise ask the user "Would you like to try Gemini?" and wait for confirmation.'
     return {'isError': state['status'] not in ('queued', 'running'),
             'content': [{'type': 'text', 'text': json.dumps(state)}]}
 
@@ -421,7 +482,7 @@ def run_detached(args, global_lock, admission_guard=None):
                 if any(root in ref_path.parents for root in (output_root() / 'sessions', output_root() / 'clients')) and ref_path.parent != folder:
                     raise ValueError('Selected generated reference belongs to another session; use its exact reference_ticket.')
             queued_args['reference_image'] = reference_data_url(args['reference_image'])
-        write_state(state_path, {'status': 'queued', 'submitted': False, 'fingerprint': fingerprint(args)})
+        write_state(state_path, {'status': 'queued', 'submitted': False, 'selection': args.get('model', 'gpt'), 'fingerprint': fingerprint(args)})
         atomic_json(job, {'args':queued_args, 'reference_path':args.get('reference_image') if args.get('reference_image') and not args['reference_image'].startswith('data:') else None})
         queue = ROOT / 'queue'
         queue.mkdir(mode=0o700, exist_ok=True)
@@ -534,7 +595,7 @@ def dispatch(message):
         requested = params.get('protocolVersion')
         version = requested if requested in ('2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25') else '2025-11-25'
         return {'protocolVersion': version, 'capabilities': {'tools': {}},
-                'serverInfo': {'name': 'openai-images', 'version': '1.6.2'}}
+                'serverInfo': {'name': 'openai-images', 'version': '1.7.0'}}
     if method == 'ping':
         return {}
     if method == 'tools/list':
@@ -583,6 +644,8 @@ def dispatch(message):
                     except BlockingIOError:
                         raise ValueError('Image connector maintenance in progress; wait before submitting.') from None
                     args = dict(params.get('arguments', {}))
+                    if args.get('model', 'gpt') not in SCHEMA['properties']['model']['enum']:
+                        raise ValueError('Choose model gpt or gemini.')
                     if params.get('name') == 'edit_reference_image':
                         ticket = args.pop('reference_ticket', None)
                         if ticket is not None:

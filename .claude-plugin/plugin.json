@@ -1,0 +1,16 @@
+{
+  "name": "omniroute-images",
+  "version": "1.7.0",
+  "author": { "name": "Hagen Bui" },
+  "description": "Generate, edit, recover, and compare images through the OmniRoute SSH bridge on macOS.",
+  "mcpServers": {
+    "images": {
+      "command": "/bin/sh",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/launch-remote.sh",
+        "claude-code",
+        "${HOME}/Library/Application Support/openai-image-mcp/image.env"
+      ]
+    }
+  }
+}
